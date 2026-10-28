@@ -74,7 +74,7 @@ interface EntryData {
 interface PatchReview {
 	files: string[];
 	flagged: string[];
-	symlinks: string[];
+	refused: string[];
 }
 
 /** Paths that run code or change tooling on your machine when pulled; shown first in /boat-pull. */
@@ -86,6 +86,12 @@ const SENSITIVE_PATHS: [RegExp, string][] = [
 	[/^\.(vscode|idea)\//, "editor config"],
 	[/(^|\/)(package\.json|\.npmrc|Makefile)$/, "scripts or install config"],
 ];
+
+/** Header lines that create, change or delete a symlink, in every form git apply acts on. */
+const SYMLINK_HEADER = /^(?:new file mode|deleted file mode|old mode|new mode) 120000$|^index [0-9a-f]+\.\.[0-9a-f]+ 120000$/m;
+const EXECUTABLE_HEADER = /^(?:new file mode|new mode) 100755$/m;
+/** The diff is made with --no-renames, so a rename or copy header means something else made it. */
+const MOVE_HEADER = /^(?:rename|copy) (?:from|to) /m;
 
 interface SshResult {
 	code: number | null;
@@ -179,6 +185,59 @@ function endpointOf(info: any): Endpoint {
 	}
 	if (typeof info.ip === "string" && info.ip) return { host: info.ip, port: 22 };
 	throw new Error(`sandbox ${info.id} has no SSH address (state: ${info.state})`);
+}
+
+function git(args: string[], cwd: string, stdin?: Buffer): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const child = spawn("git", args, { cwd, stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"] });
+		const out: Buffer[] = [];
+		const err: Buffer[] = [];
+		child.stdout!.on("data", (d) => out.push(d));
+		child.stderr!.on("data", (d) => err.push(d));
+		child.on("error", reject);
+		child.on("close", (code) => {
+			if (code === 0) resolve(Buffer.concat(out).toString());
+			else reject(new Error(Buffer.concat(err).toString().trim() || `git exit ${code}`));
+		});
+		if (stdin) child.stdin!.end(stdin);
+	});
+}
+
+/**
+ * What a patch from the sandbox would do, read on this machine from the exact bytes that will
+ * be applied. Modes come from the patch headers, which is what git apply acts on; content and
+ * binary lines can't pass for headers (they carry a prefix or contain no spaces). Paths come
+ * raw from `--numstat -z`, so quoting can't hide them. git apply itself refuses `..`, `.git`
+ * and writes beyond a symlink.
+ */
+export async function describePatch(patch: Buffer): Promise<PatchReview> {
+	const review: PatchReview = { files: [], flagged: [], refused: [] };
+	// Headers are ASCII; latin1 maps every byte, so binary hunks can't break the split.
+	for (const section of patch.toString("latin1").split(/^(?=diff --git )/m)) {
+		if (!section.startsWith("diff --git ")) continue;
+		const header = section.slice("diff --git ".length, section.indexOf("\n"));
+		const target = header.match(/ b\/(.*)$/)?.[1] ?? header;
+		if (SYMLINK_HEADER.test(section)) review.refused.push(`${target} is a symlink`);
+		else if (MOVE_HEADER.test(section)) review.refused.push(`${target} is a rename or copy`);
+		else if (EXECUTABLE_HEADER.test(section)) review.flagged.push(`${target}: made executable`);
+	}
+	const fields = (await git(["apply", "--numstat", "-z", "-"], os.tmpdir(), patch)).split("\0");
+	for (let i = 0; i < fields.length; i++) {
+		const stat = fields[i].match(/^(\d+|-)\t(\d+|-)\t([\s\S]*)$/);
+		if (!stat) {
+			if (fields[i] !== "") review.flagged.push(`unrecognized entry: ${JSON.stringify(fields[i])}`);
+			continue;
+		}
+		// A rename or copy leaves the path empty and names source and target in the next fields.
+		const paths = stat[3] === "" ? [fields[++i] ?? "", fields[++i] ?? ""] : [stat[3]];
+		const name = paths[paths.length - 1];
+		review.files.push(stat[1] === "-" ? `${name} (binary)` : `${name} (+${stat[1]} -${stat[2]})`);
+		for (const p of paths) {
+			const why = SENSITIVE_PATHS.find(([re]) => re.test(p))?.[1];
+			if (why) review.flagged.push(`${p}: ${why}`);
+		}
+	}
+	return review;
 }
 
 // --- SSH ---
@@ -570,14 +629,16 @@ export default function (pi: ExtensionAPI) {
 				// base all come from this tree, even if the agent keeps writing meanwhile.
 				const tree = (await run(`cd ${cwd} && git add -A && git write-tree`)).toString().trim();
 				if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`unexpected tree id from the sandbox: ${tree}`);
-				const patch = await run(`cd ${cwd} && git diff --binary boat-base ${tree}`);
+				const patch = await run(
+					`cd ${cwd} && git diff --no-ext-diff --no-textconv --no-color --no-renames --binary boat-base ${tree}`,
+				);
 				if (patch.length === 0) {
 					say(ctx, "Nothing to pull: the sandbox matches what you last pulled.", "info");
 					return;
 				}
 				const review = await describePatch(patch);
-				if (review.symlinks.length > 0) {
-					say(ctx, `boat-pull refused: the changes create symlinks (${review.symlinks.join(", ")}). Copy them by hand if you want them.`, "error");
+				if (review.refused.length > 0) {
+					say(ctx, `boat-pull refused, nothing was applied: ${review.refused.join(", ")}. Copy those by hand if you want them.`, "error");
 					return;
 				}
 				const summary = formatReview(review);
@@ -600,30 +661,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/**
-	 * What a patch from the sandbox would do, read on this machine from the exact bytes to be
-	 * applied. Run outside any repo so git lists every path. git apply itself refuses paths with
-	 * `..` or `.git` and writes beyond a symlink; new symlinks are refused by the caller.
-	 */
-	async function describePatch(patch: Buffer): Promise<PatchReview> {
-		const out = await gitLocal(["apply", "--numstat", "--summary", "-"], os.tmpdir(), patch);
-		const review: PatchReview = { files: [], flagged: [], symlinks: [] };
-		for (const line of out.split("\n")) {
-			const stat = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
-			if (stat) {
-				review.files.push(stat[1] === "-" ? `${stat[3]} (binary)` : `${stat[3]} (+${stat[1]} -${stat[2]})`);
-				const why = SENSITIVE_PATHS.find(([re]) => re.test(stat[3]))?.[1];
-				if (why) review.flagged.push(`${stat[3]}: ${why}`);
-				continue;
-			}
-			const mode = line.match(/^\s*(?:create|delete) mode (\d{6}) (.+)$/) ?? line.match(/^\s*mode change \d{6} => (\d{6}) (.+)$/);
-			if (!mode) continue;
-			if (mode[1] === "120000") review.symlinks.push(mode[2]);
-			else if (mode[1] === "100755" && !line.includes("delete mode")) review.flagged.push(`${mode[2]}: made executable`);
-		}
-		return review;
-	}
-
 	function formatReview(review: PatchReview): string {
 		const lines: string[] = [];
 		if (review.flagged.length > 0) lines.push("Check these first:", ...review.flagged.map((f) => `  ⚠ ${f}`), "");
@@ -644,16 +681,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function gitLocal(args: string[], cwd = localCwd, stdin?: Buffer): Promise<string> {
-		return new Promise((resolve, reject) => {
-			const child = spawn("git", args, { cwd, stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"] });
-			let out = "";
-			let err = "";
-			child.stdout!.on("data", (d) => (out += d));
-			child.stderr!.on("data", (d) => (err += d));
-			child.on("error", reject);
-			child.on("close", (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(err.trim() || `git exit ${code}`))));
-			if (stdin) child.stdin!.end(stdin);
-		});
+		return git(args, cwd, stdin).then((out) => out.trim());
 	}
 
 	// --- lifecycle ---
@@ -797,7 +825,10 @@ export default function (pi: ExtensionAPI) {
 
 	/** Files changed in the sandbox since the last /boat-pull, or -1 if that can't be checked. */
 	async function unpulledCount(a: Active): Promise<number> {
-		const r = await ssh(a, `cd ${q(a.cwd)} && git add -A && git diff --cached --name-only boat-base | wc -l`).catch(() => null);
+		const r = await ssh(
+			a,
+			`cd ${q(a.cwd)} && git add -A && git diff --cached --no-renames --name-only boat-base | wc -l`,
+		).catch(() => null);
 		const n = r?.code === 0 ? Number(r.stdout.toString().trim()) : NaN;
 		return Number.isFinite(n) ? n : -1;
 	}
