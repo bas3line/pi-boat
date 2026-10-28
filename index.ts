@@ -21,7 +21,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdirSync, realpathSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +70,22 @@ interface EntryData {
 	id: string;
 	cwd: string;
 }
+
+interface PatchReview {
+	files: string[];
+	flagged: string[];
+	symlinks: string[];
+}
+
+/** Paths that run code or change tooling on your machine when pulled; shown first in /boat-pull. */
+const SENSITIVE_PATHS: [RegExp, string][] = [
+	[/^\.github\/|^\.gitlab-ci\.yml$|^\.circleci\//, "CI config"],
+	[/(^|\/)\.(husky|githooks)\//, "git hooks"],
+	[/(^|\/)\.git(attributes|modules)$/, "git config"],
+	[/(^|\/)\.envrc$|(^|\/)\.env(\.|$)/, "environment"],
+	[/^\.(vscode|idea)\//, "editor config"],
+	[/(^|\/)(package\.json|\.npmrc|Makefile)$/, "scripts or install config"],
+];
 
 interface SshResult {
 	code: number | null;
@@ -167,6 +183,28 @@ function endpointOf(info: any): Endpoint {
 
 // --- SSH ---
 
+function knownHostsFile(id: string): string {
+	return path.join(STATE_DIR, `known_hosts-${id}`);
+}
+
+/**
+ * Authorize our key and pin the sandbox's host keys under its id. `boat ssh` checks the host
+ * against the key boat's API reports, so keys read through it are genuine. The machine and
+ * its key change on every resume, so this runs after each one.
+ */
+async function pinHost(a: Active): Promise<void> {
+	const out = await boat(["ssh", a.id, "cat /etc/ssh/ssh_host_*_key.pub"]);
+	const lines = out
+		.split("\n")
+		.map((l) => l.trim().split(/\s+/))
+		.filter((p) => p.length >= 2 && /^(ssh-|ecdsa-|sk-)/.test(p[0]))
+		.map(([type, key]) => `${a.id} ${type} ${key}`);
+	if (lines.length === 0) throw new Error(`could not read the host key of ${a.id}`);
+	writeFileSync(knownHostsFile(a.id), `${lines.join("\n")}\n`, { mode: 0o600 });
+	const r = await ssh(a, "true");
+	if (r.code !== 0) throw new Error(`SSH to ${a.id} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
+}
+
 function sshArgs(a: Active): string[] {
 	return [
 		"-i", KEY,
@@ -175,11 +213,13 @@ function sshArgs(a: Active): string[] {
 		"-o", "LogLevel=ERROR",
 		"-o", "ConnectTimeout=15",
 		"-o", "ServerAliveInterval=30",
-		// Trust on first use, per sandbox: forwarded ports are reused across sandboxes.
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", `UserKnownHostsFile=${path.join(STATE_DIR, `known_hosts-${a.id}`)}`,
+		// Pinned per sandbox by pinHost(), whatever address it has: forwarded ports are reused.
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", `HostKeyAlias=${a.id}`,
+		"-o", `UserKnownHostsFile=${knownHostsFile(a.id)}`,
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/pi-boat-%C",
+		// STATE_DIR is 0700, so no other user can plant or reach the socket.
+		"-o", `ControlPath=${path.join(STATE_DIR, "cm-%C")}`,
 		"-o", "ControlPersist=600",
 		`user@${a.endpoint.host}`,
 	];
@@ -278,6 +318,7 @@ export default function (pi: ExtensionAPI) {
 			const next = endpointOf(info);
 			if (next.host !== a.endpoint.host || next.port !== a.endpoint.port) changed = true;
 			a.endpoint = next;
+			if (changed) await pinHost(a);
 			return changed;
 		})().finally(() => {
 			recovering = null;
@@ -525,32 +566,71 @@ export default function (pi: ExtensionAPI) {
 			}
 			const cwd = q(active.cwd);
 			try {
-				const names = (await run(`cd ${cwd} && git add -A && git diff --cached --name-only boat-base`))
-					.toString()
-					.split("\n")
-					.filter(Boolean);
-				if (names.length === 0) {
+				// Freeze the sandbox's state once: the list you review, the bytes applied and the new
+				// base all come from this tree, even if the agent keeps writing meanwhile.
+				const tree = (await run(`cd ${cwd} && git add -A && git write-tree`)).toString().trim();
+				if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`unexpected tree id from the sandbox: ${tree}`);
+				const patch = await run(`cd ${cwd} && git diff --binary boat-base ${tree}`);
+				if (patch.length === 0) {
 					say(ctx, "Nothing to pull: the sandbox matches what you last pulled.", "info");
 					return;
 				}
-				if (ctx.hasUI) {
-					const shown = names.slice(0, 20).join("\n") + (names.length > 20 ? `\n… and ${names.length - 20} more` : "");
-					const ok = await ctx.ui.confirm("Pull from sandbox", `Apply ${names.length} changed file(s) to ${localCwd}?\n\n${shown}`);
-					if (!ok) return;
+				const review = await describePatch(patch);
+				if (review.symlinks.length > 0) {
+					say(ctx, `boat-pull refused: the changes create symlinks (${review.symlinks.join(", ")}). Copy them by hand if you want them.`, "error");
+					return;
 				}
-				const patch = await run(`cd ${cwd} && git diff --cached --binary boat-base`);
+				const summary = formatReview(review);
+				if (ctx.hasUI) {
+					const ok = await ctx.ui.confirm("Pull from sandbox", `Apply ${review.files.length} changed file(s) to ${localCwd}?\n\n${summary}`);
+					if (!ok) return;
+				} else {
+					say(ctx, `Applying ${review.files.length} changed file(s):\n${summary}`, "info");
+				}
 				await applyLocally(patch);
 				// Move the base so the next pull only brings what changed after this one.
 				await run(
 					`cd ${cwd} && git tag -f boat-base "$(git -c user.name=pi -c user.email=pi@boat ` +
-						`commit-tree "$(git write-tree)" -p boat-base -m 'boat: pulled')" >/dev/null`,
+						`commit-tree ${tree} -p boat-base -m 'boat: pulled')" >/dev/null`,
 				);
-				say(ctx, `Pulled ${names.length} file(s) into ${localCwd}.`, "info");
+				say(ctx, `Pulled ${review.files.length} file(s) into ${localCwd}.`, "info");
 			} catch (err) {
 				say(ctx, `boat-pull: ${errorMessage(err)}`, "error");
 			}
 		},
 	});
+
+	/**
+	 * What a patch from the sandbox would do, read on this machine from the exact bytes to be
+	 * applied. Run outside any repo so git lists every path. git apply itself refuses paths with
+	 * `..` or `.git` and writes beyond a symlink; new symlinks are refused by the caller.
+	 */
+	async function describePatch(patch: Buffer): Promise<PatchReview> {
+		const out = await gitLocal(["apply", "--numstat", "--summary", "-"], os.tmpdir(), patch);
+		const review: PatchReview = { files: [], flagged: [], symlinks: [] };
+		for (const line of out.split("\n")) {
+			const stat = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+			if (stat) {
+				review.files.push(stat[1] === "-" ? `${stat[3]} (binary)` : `${stat[3]} (+${stat[1]} -${stat[2]})`);
+				const why = SENSITIVE_PATHS.find(([re]) => re.test(stat[3]))?.[1];
+				if (why) review.flagged.push(`${stat[3]}: ${why}`);
+				continue;
+			}
+			const mode = line.match(/^\s*(?:create|delete) mode (\d{6}) (.+)$/) ?? line.match(/^\s*mode change \d{6} => (\d{6}) (.+)$/);
+			if (!mode) continue;
+			if (mode[1] === "120000") review.symlinks.push(mode[2]);
+			else if (mode[1] === "100755" && !line.includes("delete mode")) review.flagged.push(`${mode[2]}: made executable`);
+		}
+		return review;
+	}
+
+	function formatReview(review: PatchReview): string {
+		const lines: string[] = [];
+		if (review.flagged.length > 0) lines.push("Check these first:", ...review.flagged.map((f) => `  ⚠ ${f}`), "");
+		lines.push(...review.files.slice(0, 20));
+		if (review.files.length > 20) lines.push(`… and ${review.files.length - 20} more`);
+		return lines.join("\n");
+	}
 
 	/** `git apply` is atomic: on any conflict nothing is written. */
 	async function applyLocally(patch: Buffer): Promise<void> {
@@ -597,14 +677,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** Make sure our key is authorized; `boat ssh` installs it if it is not. */
-	async function authorize(a: Active): Promise<void> {
-		if ((await ssh(a, "true")).code === 0) return;
-		await boat(["ssh", a.id, "true"]);
-		const r = await ssh(a, "true");
-		if (r.code !== 0) throw new Error(`SSH to ${a.id} failed: ${r.stderr.trim() || `exit ${r.code}`}`);
-	}
-
 	/** Reattach a recorded sandbox. Returns false only if boat no longer has it. */
 	async function reattach(prev: EntryData, ctx: ExtensionContext): Promise<boolean> {
 		let info: any;
@@ -621,7 +693,7 @@ export default function (pi: ExtensionAPI) {
 			info = await boatInfo(prev.id);
 		}
 		const a: Active = { id: prev.id, cwd: prev.cwd, endpoint: endpointOf(info) };
-		await authorize(a);
+		await pinHost(a);
 		active = a;
 		return true;
 	}
@@ -634,7 +706,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const cwd = inRepo ? path.posix.join(REMOTE_HOME, path.basename(localCwd)) : `${REMOTE_HOME}/workspace`;
 			const a: Active = { id, cwd, endpoint: endpointOf(await boatInfo(id)) };
-			await authorize(a);
+			await pinHost(a);
 			if (inRepo) {
 				setStatus(ctx, `☁ boat · ${id} · copying ${path.basename(localCwd)}…`);
 				await boat(["push", id, localCwd, "--to", cwd]);
@@ -659,7 +731,9 @@ export default function (pi: ExtensionAPI) {
 		if (pi.getFlag("boat") !== true) return;
 		claimTools(ctx);
 		if (!toolsOwned) return;
-		mkdirSync(STATE_DIR, { recursive: true });
+		// Holds the SSH control sockets and pinned host keys: private to this user.
+		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		chmodSync(STATE_DIR, 0o700);
 		const prev = latestEntry(ctx);
 
 		// /new and /fork keep working in the same sandbox.
@@ -748,5 +822,7 @@ export default function (pi: ExtensionAPI) {
 		closeMaster(a);
 		const persisted = ctx.sessionManager.getSessionFile() !== undefined;
 		await boat(persisted ? ["stop", a.id] : ["delete", a.id, "--yes"]).catch(() => undefined);
+		// A resume gets a new machine and key, and pinHost() writes it again.
+		rmSync(knownHostsFile(a.id), { force: true });
 	});
 }

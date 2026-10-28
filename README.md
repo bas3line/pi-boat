@@ -36,7 +36,7 @@ pi --boat -c                  # continue the last session and reattach its sandb
 
 1. **Start.** `boat new` creates a sandbox. In a git repository, `boat push` copies the files git tracks or does not ignore, without `.git`, to `/home/user/<project>`. That copy is committed in the sandbox and tagged `boat-base`. Outside a git repository nothing is copied, and the agent starts in an empty `/home/user/workspace`.
 2. **Work.** Each tool call runs over one shared SSH connection, so a call costs a round trip, not a new handshake. `!` commands typed in pi run in the sandbox too.
-3. **Pull.** `/boat-pull` diffs the sandbox against `boat-base` and applies the patch locally with `git apply`. The apply is all or nothing: on a conflict, no file is written. Then `boat-base` moves forward, so the next pull brings only newer changes.
+3. **Pull.** `/boat-pull` freezes the sandbox's current state, fetches the diff against `boat-base` once, and shows you the files in it. It lists first anything that can run code or change tooling on your machine: CI config, git hooks, `.env`/`.envrc`, editor config, `package.json`/`.npmrc`/`Makefile`, and files made executable. When you confirm, it applies those exact bytes with `git apply`. The apply is all or nothing: on a conflict, no file is written. Then `boat-base` moves to the state you pulled, so the next pull brings only newer changes.
 4. **Quit.** If the sandbox has changes you have not pulled, it is left running, and pi prints how to get them back. Otherwise it is stopped. With `--no-session` it is deleted.
 5. **Resume.** `pi --boat -c` finds the session's sandbox, resumes it if it stopped, and reattaches.
 
@@ -49,9 +49,12 @@ If your boat account has delete-on-stop data retention on (`boat data-retention 
 ## Safety
 
 - With `--boat`, a tool call never falls back to your machine. If the sandbox is unavailable, the call fails.
+- `/boat-pull` refuses a patch that creates a symlink. `git apply` itself refuses paths with `..` or `.git` and writes through symlinks. Treat the agent's changes like any other patch: read the flagged files before you confirm.
+- Without a UI (`pi -p`), `/boat-pull` prints the file list and applies it without asking, because typing the command is the confirmation.
 - Your local environment variables are not sent to the sandbox.
 - Like any `boat new`, the sandbox gets your boat account's default environment: its stored variables and secrets.
-- Host keys are trusted on first use, per sandbox, in `~/.pi/agent/boat/`. pi-boat uses the key the boat CLI manages at `~/.ssh/ascii_box_ed25519`.
+- Host keys are pinned per sandbox id, with `StrictHostKeyChecking=yes`. The key is read through `boat ssh`, which checks it against the key boat's API reports. It is pinned again after every resume, because the machine and its key change. pi-boat uses the key the boat CLI manages at `~/.ssh/ascii_box_ed25519`.
+- SSH control sockets and pinned keys live in `~/.pi/agent/boat/`, mode 0700.
 
 ## Limitations
 
