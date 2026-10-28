@@ -87,11 +87,18 @@ const SENSITIVE_PATHS: [RegExp, string][] = [
 	[/(^|\/)(package\.json|\.npmrc|Makefile)$/, "scripts or install config"],
 ];
 
-/** Header lines that create, change or delete a symlink, in every form git apply acts on. */
-const SYMLINK_HEADER = /^(?:new file mode|deleted file mode|old mode|new mode) 120000$|^index [0-9a-f]+\.\.[0-9a-f]+ 120000$/m;
-const EXECUTABLE_HEADER = /^(?:new file mode|new mode) 100755$/m;
-/** The diff is made with --no-renames, so a rename or copy header means something else made it. */
-const MOVE_HEADER = /^(?:rename|copy) (?:from|to) /m;
+/**
+ * The only header lines a pull accepts: what git writes for regular files with --no-renames.
+ * git apply reads modes as octal and knows more headers than these, so rather than interpret
+ * anything else (symlinks, submodules, renames, copies, odd spellings of a mode), refuse it.
+ */
+const CANONICAL_HEADER = [
+	/^index [0-9a-f]{7,64}\.\.[0-9a-f]{7,64}(?: 100644| 100755)?$/,
+	/^(?:new file|deleted file|old|new) mode 100(?:644|755)$/,
+	/^--- (?:a\/|"a\/|\/dev\/null$)/,
+	/^\+\+\+ (?:b\/|"b\/|\/dev\/null$)/,
+];
+const MADE_EXECUTABLE = /^(?:new file|new) mode 100755$/;
 
 interface SshResult {
 	code: number | null;
@@ -205,21 +212,30 @@ function git(args: string[], cwd: string, stdin?: Buffer): Promise<string> {
 
 /**
  * What a patch from the sandbox would do, read on this machine from the exact bytes that will
- * be applied. Modes come from the patch headers, which is what git apply acts on; content and
- * binary lines can't pass for headers (they carry a prefix or contain no spaces). Paths come
- * raw from `--numstat -z`, so quoting can't hide them. git apply itself refuses `..`, `.git`
- * and writes beyond a symlink.
+ * be applied. Every header line must be one git writes for a regular file (CANONICAL_HEADER),
+ * and git's own count of file patches must match the headers, so nothing can hide between
+ * hunks. Paths come raw from `--numstat -z`, so quoting can't hide them. git apply itself
+ * refuses `..`, `.git` and writes beyond a symlink.
  */
 export async function describePatch(patch: Buffer): Promise<PatchReview> {
 	const review: PatchReview = { files: [], flagged: [], refused: [] };
 	// Headers are ASCII; latin1 maps every byte, so binary hunks can't break the split.
-	for (const section of patch.toString("latin1").split(/^(?=diff --git )/m)) {
-		if (!section.startsWith("diff --git ")) continue;
-		const header = section.slice("diff --git ".length, section.indexOf("\n"));
-		const target = header.match(/ b\/(.*)$/)?.[1] ?? header;
-		if (SYMLINK_HEADER.test(section)) review.refused.push(`${target} is a symlink`);
-		else if (MOVE_HEADER.test(section)) review.refused.push(`${target} is a rename or copy`);
-		else if (EXECUTABLE_HEADER.test(section)) review.flagged.push(`${target}: made executable`);
+	const text = patch.toString("latin1");
+	if (!text.startsWith("diff --git ")) review.refused.push("the patch does not start with a git header");
+	const sections = text.split(/^(?=diff --git )/m).filter((s) => s.startsWith("diff --git "));
+	for (const section of sections) {
+		const lines = section.split("\n");
+		const target = lines[0].match(/ b\/(.*)$/)?.[1] ?? lines[0].slice("diff --git ".length);
+		for (let i = 1; i < lines.length; i++) {
+			const line = lines[i];
+			if (line.startsWith("@@ ") || line === "GIT binary patch" || line.startsWith("Binary files ")) break;
+			if (line === "" && i === lines.length - 1) break;
+			if (!CANONICAL_HEADER.some((re) => re.test(line))) {
+				review.refused.push(`${target} has a header pi-boat does not accept: ${JSON.stringify(line)}`);
+				break;
+			}
+			if (MADE_EXECUTABLE.test(line)) review.flagged.push(`${target}: made executable`);
+		}
 	}
 	const fields = (await git(["apply", "--numstat", "-z", "-"], os.tmpdir(), patch)).split("\0");
 	for (let i = 0; i < fields.length; i++) {
@@ -236,6 +252,9 @@ export async function describePatch(patch: Buffer): Promise<PatchReview> {
 			const why = SENSITIVE_PATHS.find(([re]) => re.test(p))?.[1];
 			if (why) review.flagged.push(`${p}: ${why}`);
 		}
+	}
+	if (review.files.length !== sections.length) {
+		review.refused.push(`git reads ${review.files.length} file patch(es) but the patch has ${sections.length} git header(s)`);
 	}
 	return review;
 }
@@ -629,8 +648,10 @@ export default function (pi: ExtensionAPI) {
 				// base all come from this tree, even if the agent keeps writing meanwhile.
 				const tree = (await run(`cd ${cwd} && git add -A && git write-tree`)).toString().trim();
 				if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`unexpected tree id from the sandbox: ${tree}`);
+				// Pin the format so the sandbox's git config can't change what describePatch sees.
 				const patch = await run(
-					`cd ${cwd} && git diff --no-ext-diff --no-textconv --no-color --no-renames --binary boat-base ${tree}`,
+					`cd ${cwd} && git diff --no-ext-diff --no-textconv --no-color --no-renames --full-index ` +
+						`--src-prefix=a/ --dst-prefix=b/ --binary boat-base ${tree}`,
 				);
 				if (patch.length === 0) {
 					say(ctx, "Nothing to pull: the sandbox matches what you last pulled.", "info");

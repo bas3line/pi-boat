@@ -49,7 +49,7 @@ If your boat account has delete-on-stop data retention on (`boat data-retention 
 ## Safety
 
 - With `--boat`, a tool call never falls back to your machine. If the sandbox is unavailable, the call fails.
-- `/boat-pull` refuses a patch that creates, changes or removes a symlink. It reads modes from the patch headers, and file names unquoted, so odd names can't hide a flagged path. A rename arrives as a delete plus an add. `git apply` itself refuses paths with `..` or `.git` and writes through symlinks. Treat the agent's changes like any other patch: read the flagged files before you confirm.
+- `/boat-pull` accepts only the patch headers git writes for regular files. A patch that touches a symlink or a submodule, renames or copies, spells a mode oddly, or carries a file patch outside a git header is refused whole. File names are read unquoted, so odd names can't hide a flagged path. A rename arrives as a delete plus an add. `git apply` itself refuses paths with `..` or `.git` and writes through symlinks. Treat the agent's changes like any other patch: read the flagged files before you confirm.
 - Without a UI (`pi -p`), `/boat-pull` prints the file list and applies it without asking, because typing the command is the confirmation.
 - Your local environment variables are not sent to the sandbox.
 - Like any `boat new`, the sandbox gets your boat account's default environment: its stored variables and secrets.
